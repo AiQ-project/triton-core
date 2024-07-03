@@ -378,6 +378,10 @@ TRITONSERVER_ServerOptionsSetStrictModelConfig()
 {
 }
 TRITONAPI_DECLSPEC void
+TRITONSERVER_ServerOptionsSetModelConfigName()
+{
+}
+TRITONAPI_DECLSPEC void
 TRITONSERVER_ServerOptionsSetRateLimiterMode()
 {
 }
@@ -440,6 +444,10 @@ TRITONSERVER_ServerOptionsSetModelLoadRetryCount()
 }
 TRITONAPI_DECLSPEC void
 TRITONSERVER_ServerOptionsSetModelNamespacing()
+{
+}
+TRITONAPI_DECLSPEC void
+TRITONSERVER_ServerOptionsSetEnablePeerAccess()
 {
 }
 TRITONAPI_DECLSPEC void
@@ -556,6 +564,10 @@ TRITONSERVER_ServerDelete()
 }
 TRITONAPI_DECLSPEC void
 TRITONSERVER_ServerStop()
+{
+}
+TRITONAPI_DECLSPEC void
+TRITONSERVER_ServerSetExitTimeout()
 {
 }
 TRITONAPI_DECLSPEC void

@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <string>
 
 #include "constants.h"
 #include "model.h"
@@ -1069,13 +1070,14 @@ InferenceRequest::Normalize()
     const inference::ModelInput* input_config;
     RETURN_IF_ERROR(model_raw_->GetInput(pr.second.Name(), &input_config));
 
+    auto& input_id = pr.first;
     auto& input = pr.second;
     auto shape = input.MutableShape();
 
     if (input.DType() != input_config->data_type()) {
       return Status(
           Status::Code::INVALID_ARG,
-          LogRequest() + "inference input '" + pr.first + "' data-type is '" +
+          LogRequest() + "inference input '" + input_id + "' data-type is '" +
               std::string(
                   triton::common::DataTypeToProtocolString(input.DType())) +
               "', but model '" + ModelName() + "' expects '" +
@@ -1098,7 +1100,7 @@ InferenceRequest::Normalize()
                 Status::Code::INVALID_ARG,
                 LogRequest() +
                     "All input dimensions should be specified for input '" +
-                    pr.first + "' for model '" + ModelName() + "', got " +
+                    input_id + "' for model '" + ModelName() + "', got " +
                     triton::common::DimsListToString(input.OriginalShape()));
           } else if (
               (config_dims[i] != triton::common::WILDCARD_DIM) &&
@@ -1127,7 +1129,7 @@ InferenceRequest::Normalize()
         }
         return Status(
             Status::Code::INVALID_ARG,
-            LogRequest() + "unexpected shape for input '" + pr.first +
+            LogRequest() + "unexpected shape for input '" + input_id +
                 "' for model '" + ModelName() + "'. Expected " +
                 triton::common::DimsListToString(full_dims) + ", got " +
                 triton::common::DimsListToString(input.OriginalShape()) + ". " +
@@ -1169,8 +1171,52 @@ InferenceRequest::Normalize()
         input.MutableShapeWithBatchDim()->push_back(d);
       }
     }
-  }
+    // Matching incoming request's shape and byte size to make sure the
+    // payload contains correct number of elements.
+    // Note: Since we're using normalized input.ShapeWithBatchDim() here,
+    // make sure that all the normalization is before the check.
+    {
+      const auto& data_type = input.DType();
 
+      // FIXME: Skip byte size validation for TensorRT backend because it breaks
+      // shape-size assumption. See DLIS-6805 for proper fix for TRT backend
+      // reformat_free tensors.
+      bool skip_byte_size_check = false;
+      constexpr char trt_prefix[] = "tensorrt_";
+      const std::string& platform = model_raw_->Config().platform();
+      skip_byte_size_check |= (platform.rfind(trt_prefix) == 0);
+
+      if (!skip_byte_size_check) {
+        TRITONSERVER_MemoryType input_memory_type;
+        // Because Triton expects STRING type to be in special format
+        // (prepend 4 bytes to specify string length), so need to add all the
+        // first 4 bytes for each element to find expected byte size
+        if (data_type == inference::DataType::TYPE_STRING) {
+          RETURN_IF_ERROR(
+              ValidateBytesInputs(input_id, input, &input_memory_type));
+          // FIXME: Temporarily skips byte size checks for GPU tensors. See
+          // DLIS-6820.
+          skip_byte_size_check |=
+              (input_memory_type == TRITONSERVER_MEMORY_GPU);
+        } else {
+          const auto& input_dims = input.ShapeWithBatchDim();
+          int64_t expected_byte_size = INT_MAX;
+          expected_byte_size =
+              triton::common::GetByteSize(data_type, input_dims);
+          const size_t& byte_size = input.Data()->TotalByteSize();
+          if ((byte_size > INT_MAX) ||
+              (static_cast<int64_t>(byte_size) != expected_byte_size)) {
+            return Status(
+                Status::Code::INVALID_ARG,
+                LogRequest() + "input byte size mismatch for input '" +
+                    input_id + "' for model '" + ModelName() + "'. Expected " +
+                    std::to_string(expected_byte_size) + ", got " +
+                    std::to_string(byte_size));
+          }
+        }
+      }
+    }
+  }
   return Status::Success;
 }
 
@@ -1232,6 +1278,95 @@ InferenceRequest::ValidateRequestInputs()
               ". Please provide all required input(s).");
     }
   }
+  return Status::Success;
+}
+
+Status
+InferenceRequest::ValidateBytesInputs(
+    const std::string& input_id, const Input& input,
+    TRITONSERVER_MemoryType* buffer_memory_type) const
+{
+  const auto& input_dims = input.ShapeWithBatchDim();
+
+  int64_t element_count = triton::common::GetElementCount(input_dims);
+  int64_t element_checked = 0;
+  size_t remaining_element_size = 0;
+
+  size_t buffer_next_idx = 0;
+  const size_t buffer_count = input.DataBufferCount();
+
+  const char* buffer = nullptr;
+  size_t remaining_buffer_size = 0;
+  int64_t buffer_memory_id;
+
+  // Validate elements until all buffers have been fully processed.
+  while (remaining_buffer_size || buffer_next_idx < buffer_count) {
+    // Get the next buffer if not currently processing one.
+    if (!remaining_buffer_size) {
+      // Reset remaining buffer size and pointers for next buffer.
+      RETURN_IF_ERROR(input.DataBuffer(
+          buffer_next_idx++, (const void**)(&buffer), &remaining_buffer_size,
+          buffer_memory_type, &buffer_memory_id));
+
+      if (*buffer_memory_type == TRITONSERVER_MEMORY_GPU) {
+        return Status::Success;
+      }
+    }
+
+    constexpr size_t kElementSizeIndicator = sizeof(uint32_t);
+    // Get the next element if not currently processing one.
+    if (!remaining_element_size) {
+      // FIXME: Assume the string element's byte size indicator is not spread
+      // across buffer boundaries for simplicity.
+      if (remaining_buffer_size < kElementSizeIndicator) {
+        return Status(
+            Status::Code::INVALID_ARG,
+            LogRequest() +
+                "element byte size indicator exceeds the end of the buffer.");
+      }
+
+      // Start the next element and reset the remaining element size.
+      remaining_element_size = *(reinterpret_cast<const uint32_t*>(buffer));
+      element_checked++;
+
+      // Advance pointer and remainder by the indicator size.
+      buffer += kElementSizeIndicator;
+      remaining_buffer_size -= kElementSizeIndicator;
+    }
+
+    // If the remaining buffer fits it: consume the rest of the element, proceed
+    // to the next element.
+    if (remaining_buffer_size >= remaining_element_size) {
+      buffer += remaining_element_size;
+      remaining_buffer_size -= remaining_element_size;
+      remaining_element_size = 0;
+    }
+    // Otherwise the remaining element is larger: consume the rest of the
+    // buffer, proceed to the next buffer.
+    else {
+      remaining_element_size -= remaining_buffer_size;
+      remaining_buffer_size = 0;
+    }
+  }
+
+  // Validate the number of processed buffers exactly match expectations.
+  if (buffer_next_idx != buffer_count) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        LogRequest() + "expected " + std::to_string(buffer_count) +
+            " buffers for inference input '" + input_id + "', got " +
+            std::to_string(buffer_next_idx));
+  }
+
+  // Validate the number of processed elements exactly match expectations.
+  if (element_checked != element_count) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        LogRequest() + "expected " + std::to_string(element_count) +
+            " string elements for inference input '" + input_id + "', got " +
+            std::to_string(element_checked));
+  }
+
   return Status::Success;
 }
 

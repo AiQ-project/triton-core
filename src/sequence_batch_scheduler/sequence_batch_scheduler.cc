@@ -711,6 +711,11 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
   auto sb_itr = sequence_to_batcherseqslot_map_.find(correlation_id);
   auto bl_itr = sequence_to_backlog_map_.find(correlation_id);
 
+  sequencer_->AddReleaseCallback(
+      irequest,
+      [this](std::unique_ptr<InferenceRequest>& request, const uint32_t flags)
+          -> Status { return sequencer_->RescheduleRequest(request, flags); });
+
   // If this request is not starting a new sequence its correlation ID
   // should already be known with a target in either a sequence slot
   // or in the backlog. If it doesn't then the sequence wasn't started
@@ -850,12 +855,6 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
   LOG_VERBOSE(1) << "Enqueuing CORRID " << correlation_id << " into batcher "
                  << model_instance->Name() << ", sequence slot " << seq_slot
                  << ": " << irequest->ModelName();
-
-  sequencer_->AddReleaseCallback(
-      irequest,
-      [this](std::unique_ptr<InferenceRequest>& request, const uint32_t flags)
-          -> Status { return sequencer_->RescheduleRequest(request, flags); });
-
   batchers_[model_instance]->Enqueue(seq_slot, correlation_id, irequest);
   return Status::Success;
 }
@@ -883,6 +882,24 @@ SequenceBatchScheduler::ReleaseSequenceSlot(
     std::deque<std::unique_ptr<InferenceRequest>>* requests)
 {
   std::unique_lock<std::mutex> lock(mu_);
+
+  // If we are releasing the slot for a cancelled sequence,
+  // we have to clean up the sequence
+  // otherwise the reaper will try to clean it up again.
+  if (!requests->empty() && requests->front()) {
+    const InferenceRequest::SequenceId& corr_id =
+        requests->front()->CorrelationId();
+    LOG_VERBOSE(1) << "Releasing canceled sequence CORRID " << corr_id;
+
+    // Clean up the correlation id to sequence slot mapping, to avoid the reaper
+    // from trying to release the same slot again on this instance of the
+    // correlation id.
+    sequence_to_batcherseqslot_map_.erase(corr_id);
+    // Clean up the correlation id to sequence timeout timestamp mapping, to
+    // avoid removal of a newer sequence from the backlog upon previous timeout
+    // if the same id is re-used by the newer sequence.
+    correlation_id_timestamps_.erase(corr_id);
+  }
 
   // If there are any remaining requests on the releasing sequence slot, those
   // requests will be cancelled.
@@ -1970,7 +1987,11 @@ OldestSequenceBatch::CompleteAndNext(const uint32_t seq_slot)
                          << model_instance_->Name() << ", slot " << seq_slot;
           release_seq_slot = true;
         } else if (irequest->IsCancelled()) {
-          LOG_VERBOSE(1) << "force-end cancelled sequence in batcher "
+          const InferenceRequest::SequenceId& correlation_id =
+              irequest->CorrelationId();
+          LOG_VERBOSE(1) << irequest->LogRequest()
+                         << "force-end cancelled sequence CORRID "
+                         << correlation_id << " in batcher "
                          << model_instance_->Name() << ", slot " << seq_slot;
           release_seq_slot = true;
           retain_queue_front = true;

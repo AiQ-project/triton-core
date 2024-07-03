@@ -747,6 +747,10 @@ class InferenceRequest {
   // Helper for validating Inputs
   Status ValidateRequestInputs();
 
+  Status ValidateBytesInputs(
+      const std::string& input_id, const Input& input,
+      TRITONSERVER_MemoryType* buffer_memory_type) const;
+
   // Helpers for pending request metrics
   void IncrementPendingRequestCount();
   void DecrementPendingRequestCount();
